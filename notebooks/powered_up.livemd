@@ -3,7 +3,7 @@
 ```elixir
 Mix.install([
   # Until ex_lwp is on Hex. Then use {:ex_lwp, "~> 0.1.0"}
-  {:ex_lwp, github: "ErikMejerHansen/ex_lwp", branch: "claude/compassionate-gauss-ky4v4w"},
+  {:ex_lwp, github: "ErikMejerHansen/ex_lwp"},
   {:kino_web_bluetooth, "~> 0.1.0"}
 ])
 ```
