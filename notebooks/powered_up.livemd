@@ -1,0 +1,495 @@
+# Powered Up over Web Bluetooth
+
+```elixir
+Mix.install([
+  # Until ex_lwp is on Hex. Then use {:ex_lwp, "~> 0.1.0"}
+  {:ex_lwp, github: "ErikMejerHansen/ex_lwp", branch: "claude/compassionate-gauss-ky4v4w"},
+  {:kino_web_bluetooth, "~> 0.1.0"}
+])
+```
+
+## About
+
+This notebook talks to a LEGO® Powered Up hub (City Hub, Technic Hub,
+Boost Move Hub, ...) from Livebook.
+[KinoWebBluetooth](https://github.com/ErikMejerHansen/kino_web_bluetooth)
+carries the bytes over your browser's Web Bluetooth, and
+[ExLWP](https://github.com/ErikMejerHansen/ex_lwp) turns them into LEGO
+Wireless Protocol messages.
+
+You need a Chromium based browser (Chrome, Edge). Press the hub's button
+so it advertises (its light blinks).
+
+> ExLWP and KinoWebBluetooth are not affiliated with, sponsored,
+> authorized or endorsed by The LEGO Group. LEGO® and Powered Up are
+> trademarks of The LEGO Group.
+
+## Connect
+
+Evaluate the Smart Cell below, click **Connect** and pick your hub. The
+service UUID is already set to the LEGO Hub Service.
+
+<!-- livebook:{"attrs":"eyJkZXZpY2VfaWQiOiJibGUtbHdwLWh1YiIsInNlcnZpY2VfdXVpZCI6IjAwMDAxNjIzLTEyMTItZWZkZS0xNjIzLTc4NWZlYWJjZDEyMyIsInZhcmlhYmxlIjoiaHViX2RldmljZSIsIndyaXRlcyI6e319","chunks":null,"kind":"Elixir.KinoWebBluetooth.SmartCell","livebook_object":"smart_cell"} -->
+
+```elixir
+hub_device = KinoWebBluetooth.device("ble-lwp-hub")
+```
+
+## A small helper
+
+Every message, in both directions, goes through the one LEGO Hub
+Characteristic. `Hub` sends an ExLWP message and waits for the reply
+you ask for. If the hub answers with a `GenericError` for the command
+instead, you get that back as an error.
+
+ExLWP is stateless, so the helper keeps the bytes of an unfinished
+message and hands them back to `ExLWP.decode_stream/1` with the next
+notification.
+
+```elixir
+defmodule Hub do
+  alias ExLWP.{Enums, Message}
+
+  defstruct [:characteristic]
+
+  @doc "Finds the LEGO Hub Characteristic on a connected device."
+  def new(device) do
+    :ok = KinoWebBluetooth.await_connected(device)
+
+    %Hub{
+      characteristic:
+        KinoWebBluetooth.characteristic!(device, ExLWP.service_uuid(), ExLWP.characteristic_uuid())
+    }
+  end
+
+  @doc "Encodes a message (a struct or raw bytes) and writes it to the hub."
+  def send_message(%Hub{} = hub, message) do
+    KinoWebBluetooth.write(hub.characteristic, ExLWP.encode(message))
+  end
+
+  @doc """
+  Sends a message and waits for the first message for which `reply?`
+  returns true.
+  """
+  def request(%Hub{} = hub, message, reply?, timeout \\ 5_000) do
+    char = hub.characteristic
+    :ok = KinoWebBluetooth.subscribe(char)
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    try do
+      with :ok <- send_message(hub, message) do
+        await(char, reply?, command_type(message), <<>>, deadline)
+      end
+    after
+      KinoWebBluetooth.unsubscribe(char)
+      flush(char)
+    end
+  end
+
+  @doc "Asks for a hub property and returns its value."
+  def property(%Hub{} = hub, property) do
+    reply? = &match?(%Message.HubProperty{property: ^property, operation: :update}, &1)
+
+    with {:ok, %{value: value}} <-
+           request(hub, ExLWP.Messages.request_hub_property(property), reply?) do
+      {:ok, value}
+    end
+  end
+
+  @doc "Asks for information about a mode of a port."
+  def mode_info(%Hub{} = hub, port, mode, type) do
+    message = ExLWP.Messages.port_mode_information_request(port, mode, type)
+
+    reply? =
+      &match?(%Message.PortModeInformation{port: ^port, mode: ^mode, information_type: ^type}, &1)
+
+    with {:ok, %{value: value}} <- request(hub, message, reply?), do: {:ok, value}
+  end
+
+  @doc """
+  Sends an output command and waits until the hub reports it completed
+  (or discarded).
+  """
+  def run(%Hub{} = hub, %Message.PortOutputCommand{port: port} = command, timeout \\ 10_000) do
+    reply? = fn
+      %Message.PortOutputCommandFeedback{feedback: feedback} ->
+        Enum.any?(feedback, fn {p, flags} ->
+          p == port and
+            (:buffer_empty_command_completed in flags or :current_command_discarded in flags)
+        end)
+
+      _other ->
+        false
+    end
+
+    request(hub, command, reply?, timeout)
+  end
+
+  @doc "Returns a stream of every message the hub sends."
+  def messages(%Hub{} = hub) do
+    hub.characteristic
+    |> KinoWebBluetooth.stream()
+    |> Stream.transform(<<>>, fn bytes, buffer ->
+      {results, rest} = ExLWP.decode_stream(buffer <> bytes)
+      {for({:ok, message} <- results, do: message), rest}
+    end)
+  end
+
+  defp await(char, reply?, command_type, buffer, deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:kino_web_bluetooth, :notification, ^char, bytes} ->
+        {results, rest} = ExLWP.decode_stream(buffer <> bytes)
+        messages = for {:ok, message} <- results, do: message
+
+        error =
+          Enum.find(messages, fn
+            %Message.GenericError{command_type: ^command_type, error_code: code} -> code != :ack
+            _other -> false
+          end)
+
+        case {error, Enum.find(messages, reply?)} do
+          {nil, nil} -> await(char, reply?, command_type, rest, deadline)
+          {nil, reply} -> {:ok, reply}
+          {error, _} -> {:error, error}
+        end
+
+      {:kino_web_bluetooth, :disconnected, ^char} ->
+        {:error, :disconnected}
+    after
+      remaining -> {:error, :timeout}
+    end
+  end
+
+  defp command_type(<<type, _rest::binary>>), do: Enums.to_name(:message_type, type)
+  defp command_type(message), do: Enums.to_name(:message_type, Message.id(message))
+
+  defp flush(char) do
+    receive do
+      {:kino_web_bluetooth, :notification, ^char, _bytes} -> flush(char)
+    after
+      0 -> :ok
+    end
+  end
+end
+
+hub = Hub.new(hub_device)
+```
+
+## Watch what the hub sends
+
+This cell listens to everything the hub sends, in the background. As
+soon as it subscribes, the hub reports every device attached to it,
+including internal ones like its light and tilt sensor. Those show up
+in the table on the left. Plug a motor or sensor in or out and watch the
+table change.
+
+Everything else the hub sends shows up in the log on the right, except
+port values, which can be many.
+
+```elixir
+alias ExLWP.{Message, Messages}
+
+devices_frame = Kino.Frame.new()
+log_frame = Kino.Frame.new()
+
+render_devices = fn devices ->
+  rows =
+    for {port, io} <- Enum.sort(devices) do
+      %{
+        port: port,
+        device: inspect(io.io_type),
+        event: inspect(io.event),
+        hardware: to_string(io.hardware_revision || ""),
+        software: to_string(io.software_revision || ""),
+        combines: if(io.port_a, do: "#{io.port_a} + #{io.port_b}", else: "")
+      }
+    end
+
+  content =
+    if rows == [],
+      do: Kino.Markdown.new("_No devices yet_"),
+      else: Kino.DataTable.new(rows, keys: [:port, :device, :event, :hardware, :software, :combines])
+
+  Kino.Frame.render(devices_frame, content)
+end
+
+render_devices.(%{})
+
+hub
+|> Hub.messages()
+|> Kino.listen(%{}, fn
+  %Message.HubAttachedIO{port: port, event: :detached}, devices ->
+    devices = Map.delete(devices, port)
+    render_devices.(devices)
+    {:cont, devices}
+
+  %Message.HubAttachedIO{port: port} = io, devices ->
+    devices = Map.put(devices, port, io)
+    render_devices.(devices)
+    {:cont, devices}
+
+  %type{}, devices when type in [Message.PortValueSingle, Message.PortValueCombined] ->
+    {:cont, devices}
+
+  message, devices ->
+    Kino.Frame.append(log_frame, Kino.Text.new(inspect(message)))
+    {:cont, devices}
+end)
+
+Kino.Layout.grid([devices_frame, log_frame], columns: 2, boxed: true)
+```
+
+## Ask the hub about itself
+
+Hub properties are typed: versions decode to `ExLWP.Version`, the system
+type to the hub kind, and so on. A hub that doesn't support a property
+answers with an error.
+
+```elixir
+show = fn
+  {:ok, %ExLWP.Version{} = version} -> to_string(version)
+  {:ok, <<_::binary-size(6)>> = mac} -> mac |> Base.encode16() |> String.replace(~r/(..)(?!$)/, "\\1:")
+  {:ok, value} -> value
+  {:error, error} -> {:error, error}
+end
+
+properties = [
+  :advertising_name,
+  :manufacturer_name,
+  :system_type_id,
+  :fw_version,
+  :hw_version,
+  :radio_firmware_version,
+  :lwp_version,
+  :battery_type,
+  :battery_voltage,
+  :rssi,
+  :button,
+  :primary_mac_address,
+  :secondary_mac_address,
+  :hw_network_id,
+  :hw_network_family
+]
+
+for property <- properties, into: %{} do
+  {property, show.(Hub.property(hub, property))}
+end
+```
+
+Messages can also be written as raw bytes. `0x01, 0x06, 0x05` asks for
+the battery level (Hub Properties, Battery Voltage, Request Update):
+
+```elixir
+Hub.request(hub, <<0x01, 0x06, 0x05>>, &match?(%Message.HubProperty{property: :battery_voltage}, &1))
+```
+
+Ask for an update whenever the battery level or the button changes. The
+updates appear in the log above. Press the hub's button briefly to try
+it.
+
+```elixir
+:ok = Hub.send_message(hub, Messages.enable_hub_property_updates(:battery_voltage))
+:ok = Hub.send_message(hub, Messages.enable_hub_property_updates(:button))
+```
+
+## Explore a port
+
+Pick a port from the devices table. This asks the device on it which
+modes it has, and what each mode measures.
+
+```elixir
+port = 0
+
+{:ok, info} =
+  Hub.request(
+    hub,
+    Messages.port_information_request(port, :mode_info),
+    &match?(%Message.PortInformation{port: ^port, information_type: :mode_info}, &1)
+  )
+```
+
+```elixir
+show_info = fn
+  {:ok, %ExLWP.ValueFormat{} = f} -> "#{f.datasets} × #{f.type} (#{f.figures} figures, #{f.decimals} decimals)"
+  {:ok, {min, max}} -> "#{min} .. #{max}"
+  {:ok, value} -> to_string(value)
+  {:error, _} -> "-"
+end
+
+rows =
+  for mode <- 0..(info.total_mode_count - 1) do
+    %{
+      mode: mode,
+      input: mode in info.input_modes,
+      output: mode in info.output_modes,
+      name: show_info.(Hub.mode_info(hub, port, mode, :name)),
+      symbol: show_info.(Hub.mode_info(hub, port, mode, :symbol)),
+      raw: show_info.(Hub.mode_info(hub, port, mode, :raw)),
+      si: show_info.(Hub.mode_info(hub, port, mode, :si)),
+      format: show_info.(Hub.mode_info(hub, port, mode, :value_format))
+    }
+  end
+
+Kino.DataTable.new(rows, keys: [:mode, :name, :symbol, :input, :output, :raw, :si, :format])
+```
+
+## Read a sensor
+
+Pick a port and an input mode from the table above, e.g. mode 2 (`POS`)
+of a motor, or mode 0 of a color or distance sensor. This puts the port
+in that mode and decodes its values with the mode's value format.
+
+```elixir
+sensor_port = 0
+sensor_mode = 2
+
+{:ok, format} = Hub.mode_info(hub, sensor_port, sensor_mode, :value_format)
+
+reading = Kino.Frame.new()
+
+# Listen before setting up the port, to catch the first value too
+hub
+|> Hub.messages()
+|> Kino.listen(fn
+  %Message.PortValueSingle{port: ^sensor_port, value: bytes} ->
+    case ExLWP.ValueFormat.decode(format, bytes) do
+      {:ok, values} -> Kino.Frame.render(reading, Kino.Text.new(inspect(values)))
+      {:error, reason} -> Kino.Frame.render(reading, Kino.Text.new("#{reason}: #{inspect(bytes)}"))
+    end
+
+  _other ->
+    :ok
+end)
+
+{:ok, _} =
+  Hub.request(
+    hub,
+    Messages.port_input_format_setup(sensor_port, sensor_mode, 1),
+    &match?(%Message.PortInputFormatSingle{port: ^sensor_port}, &1)
+  )
+
+reading
+```
+
+Turn the motor by hand, or move something in front of the sensor, and
+watch the value change. Stop the updates with:
+
+```elixir
+Hub.request(
+  hub,
+  Messages.port_input_format_setup(sensor_port, sensor_mode, 1, false),
+  &match?(%Message.PortInputFormatSingle{port: ^sensor_port}, &1)
+)
+```
+
+## Drive a motor
+
+These need a motor with an encoder (tacho), like the Boost, Technic or
+SPIKE motors. On a City Hub, ports A and B are `0` and `1`.
+
+`Hub.run/2` waits for the hub to report the command completed:
+
+```elixir
+motor_port = 0
+
+Hub.run(hub, Messages.start_speed_for_degrees(motor_port, 360, 50))
+```
+
+```elixir
+Hub.run(hub, Messages.start_speed_for_time(motor_port, 2_000, -30, end_state: :float))
+```
+
+```elixir
+Hub.run(hub, Messages.goto_absolute_position(motor_port, 0, 40, end_state: :hold))
+```
+
+Commands without an end run until another command replaces them, so
+send those without waiting:
+
+```elixir
+:ok = Hub.send_message(hub, Messages.start_speed(motor_port, 30))
+Process.sleep(2_000)
+:ok = Hub.send_message(hub, Messages.start_power(motor_port, :brake))
+```
+
+Motors without an encoder, like train motors, only take power:
+
+```elixir
+:ok = Hub.send_message(hub, Messages.start_power(motor_port, 50))
+Process.sleep(1_000)
+:ok = Hub.send_message(hub, Messages.start_power(motor_port, :float))
+```
+
+## Two motors in sync
+
+Combine two motor ports into a virtual port. The hub replies with an
+attached virtual I/O for the new port. Some hubs (like the Boost Move
+Hub) already have one for their internal motors, and answer this with
+an error instead: use the virtual port from the devices table then.
+
+```elixir
+{:ok, %Message.HubAttachedIO{port: virtual_port}} =
+  Hub.request(
+    hub,
+    Messages.virtual_port_connect(0, 1),
+    &match?(%Message.HubAttachedIO{event: :attached_virtual}, &1)
+  )
+```
+
+Turn left in place, then drive straight:
+
+```elixir
+Hub.run(hub, Messages.start_speed_for_degrees_synced(virtual_port, 360, 50, -50))
+Hub.run(hub, Messages.start_speed_for_time_synced(virtual_port, 1_500, 50, 50))
+```
+
+```elixir
+Hub.request(
+  hub,
+  Messages.virtual_port_disconnect(virtual_port),
+  &match?(%Message.HubAttachedIO{port: ^virtual_port, event: :detached}, &1)
+)
+```
+
+## The hub's light
+
+The hub's light is the port with `:rgb_light` in the devices table,
+usually `50`. Set it to a color number (`0..10`) in mode 0:
+
+```elixir
+led_port = 50
+
+Hub.request(
+  hub,
+  Messages.port_input_format_setup(led_port, 0, 1, false),
+  &match?(%Message.PortInputFormatSingle{port: ^led_port}, &1)
+)
+
+Hub.run(hub, Messages.set_rgb_color_no(led_port, 9))
+```
+
+Or to any color, in mode 1:
+
+```elixir
+Hub.request(
+  hub,
+  Messages.port_input_format_setup(led_port, 1, 1, false),
+  &match?(%Message.PortInputFormatSingle{port: ^led_port}, &1)
+)
+
+Hub.run(hub, Messages.set_rgb_colors(led_port, 0x30, 0x47, 0x55))
+```
+
+## Clean up
+
+Stop the hub property updates, then disconnect. **Disconnect** in the
+Smart Cell works too; `Messages.switch_off()` turns the hub off
+instead.
+
+```elixir
+:ok = Hub.send_message(hub, Messages.disable_hub_property_updates(:battery_voltage))
+:ok = Hub.send_message(hub, Messages.disable_hub_property_updates(:button))
+Hub.send_message(hub, Messages.disconnect())
+```

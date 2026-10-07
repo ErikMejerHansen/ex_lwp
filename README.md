@@ -95,6 +95,16 @@ ExLWP.Messages.port_mode_information_request(0, 2, :value_format)
 {:ok, [position]} = ExLWP.ValueFormat.decode(format, bytes)
 ```
 
+## Livebook
+
+[![Run in Livebook](https://livebook.dev/badge/v1/blue.svg)](https://livebook.dev/run?url=https%3A%2F%2Fgithub.com%2FErikMejerHansen%2Fex_lwp%2Fblob%2Fmain%2Fnotebooks%2Fpowered_up.livemd)
+
+[notebooks/powered_up.livemd](notebooks/powered_up.livemd) connects to a
+hub over Web Bluetooth with
+[KinoWebBluetooth](https://github.com/ErikMejerHansen/kino_web_bluetooth),
+lists the devices attached to it, reads its properties, explores the modes
+of a port, reads a sensor, drives motors and sets the hub's light.
+
 ## Modules
 
 | Module                | Purpose                                              |

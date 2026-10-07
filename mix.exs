@@ -65,7 +65,7 @@ defmodule ExLWP.MixProject do
     [
       main: "readme",
       source_ref: "v#{@version}",
-      extras: ["README.md"],
+      extras: ["README.md", "notebooks/powered_up.livemd"],
       groups_for_modules: [
         Codec: [ExLWP, ExLWP.Message, ExLWP.Output, ExLWP.Messages],
         "Wire format": [
