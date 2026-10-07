@@ -18,10 +18,7 @@ defmodule ExLWP.ArchitectureTest do
 
       for module <- modules do
         # Protocol implementations are named after the protocol
-        Code.ensure_loaded!(module)
-
-        name =
-          if function_exported?(module, :__impl__, 1), do: module.__impl__(:for), else: module
+        name = if protocol_impl?(module), do: module.__impl__(:for), else: module
 
         assert name == ExLWP or String.starts_with?(inspect(name), "ExLWP.")
       end
@@ -75,7 +72,10 @@ defmodule ExLWP.ArchitectureTest do
   describe "Given the documentation" do
     test "when read, then every public module and function is documented" do
       {:ok, modules} = :application.get_key(:ex_lwp, :modules)
-      library = Enum.reject(modules, &(&1 in [ExLWP.Spec, ExLWP.SpecFormatter]))
+      # Protocol implementations are not documented on their own, and only
+      # Elixir 1.18+ hides their docs
+      library =
+        Enum.reject(modules, &(&1 in [ExLWP.Spec, ExLWP.SpecFormatter] or protocol_impl?(&1)))
 
       for module <- library do
         {:docs_v1, _, :elixir, _, moduledoc, _, docs} = Code.fetch_docs(module)
@@ -90,5 +90,10 @@ defmodule ExLWP.ArchitectureTest do
         end
       end
     end
+  end
+
+  defp protocol_impl?(module) do
+    Code.ensure_loaded!(module)
+    function_exported?(module, :__impl__, 1)
   end
 end
